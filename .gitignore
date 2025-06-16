@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env/
+.env.*  # if you ever use dotenv variants
+
+# Logs and debug
+*.log
+
+# VSCode settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python packaging (if you build wheels etc.)
+build/
+dist/
+*.egg-info/
+
+# Jupyter notebooks (if used)
+.ipynb_checkpoints/
+
+# Symbol embeddings cache (if you ever save as .npy etc.)
+*.npy
+*.npz
+
+# Test outputs / temp files
+*.tmp
+*.bak
