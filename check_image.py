@@ -1,3 +1,5 @@
+import os
+import re
 import torch
 import clip
 import numpy as np
@@ -6,119 +8,144 @@ from PIL import Image
 from shapely.geometry import box
 from shapely.ops import unary_union
 
-# === 1. Setup CLIP Model ===
+# === Settings ===
+INPUT_FOLDER = "input_images"
+OUTPUT_FOLDER = "output_images"
+PATCH_SIZE = 96
+STRIDE = 32
+THRESHOLD = 0.29
+LOG_PATH = "renamed_log.txt"
+
+# Create output folder if needed
+os.makedirs(INPUT_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# === CLIP Setup ===
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model, preprocess = clip.load("ViT-B/32", device=device)
 
-# === 2. Load Image ===
-image_path = "roblox_skin.png"
-original_cv = cv2.imread(image_path)
-original_rgb = cv2.cvtColor(original_cv, cv2.COLOR_BGR2RGB)
-height, width, _ = original_rgb.shape
-output = original_cv.copy()
-
-# === 3. Define Patch Scanning Params ===
-patch_size = 96
-stride = 32
-
-# === 4. Define Suspicious Text Prompts ===
 prompts = [
-    "nazi symbol", "swastika", "kkk badge", "racist insignia",
-    "offensive patch", "white supremacist symbol", "wehrmacht eagle",
-    "reichsadler emblem", "nazi eagle badge", "german military patch",
-    "silver nazi eagle", "german eagle insignia", "metal eagle badge on black uniform"
+    # Clothing prompts
+    "black thong", "black lingerie thong", "exposed crotch", "revealing groin",
+    "tight underwear", "nsfw underwear avatar", "bikini underwear", "lingerie",
+    "sexualized demon avatar", "anime girl in thong", "revealing lower body",
+    
+    # Symbol prompts
+    "swastika", "nazi eagle", "wehrmacht eagle", "kkk badge", "offensive patch"
 ]
-text_tokens = clip.tokenize(prompts).to(device)
 
+text_tokens = clip.tokenize(prompts).to(device)
 with torch.no_grad():
     text_features = model.encode_text(text_tokens)
     text_features /= text_features.norm(dim=-1, keepdim=True)
 
-# === 5. Scan Patches & Filter ===
-patch_tensors = []
-patch_coords = []
-all_boxes = []
-all_labels = []
+# === Rename files to safe format ===
+safe_files = []
+log = []
 
-for y in range(0, height - patch_size + 1, stride):
-    for x in range(0, width - patch_size + 1, stride):
-        patch = original_rgb[y:y+patch_size, x:x+patch_size]
-        gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
-        stddev = gray.std()
-        brightness = gray.mean()
+for i, filename in enumerate(os.listdir(INPUT_FOLDER)):
+    if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+        continue
 
-        if stddev < 8 or brightness > 245 or brightness < 10:
-            cv2.rectangle(output, (x, y), (x+patch_size, y+patch_size), (150, 150, 150), 1)
-            continue
+    original_path = os.path.join(INPUT_FOLDER, filename)
 
-        cv2.rectangle(output, (x, y), (x+patch_size, y+patch_size), (255, 200, 100), 1)
+    # Create safe filename
+    safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', filename)
+    if safe_name != filename:
+        safe_path = os.path.join(INPUT_FOLDER, safe_name)
+        os.rename(original_path, safe_path)
+        log.append(f"{filename} → {safe_name}")
+        safe_files.append(safe_name)
+    else:
+        safe_files.append(filename)
 
-        patch_pil = Image.fromarray(patch)
-        patch_tensor = preprocess(patch_pil).unsqueeze(0)
-        patch_tensors.append(patch_tensor)
-        patch_coords.append((x, y))
+# Save rename log
+if log:
+    with open(LOG_PATH, "w", encoding="utf-8") as f:
+        f.write("Renamed files:\n" + "\n".join(log))
+    print(f"✏️ Renamed {len(log)} files. See {LOG_PATH}")
 
-print(f"📦 {len(patch_tensors)} patches processed")
+# === Process Images ===
+for filename in sorted(safe_files):
+    input_path = os.path.join(INPUT_FOLDER, filename)
+    output_path = os.path.join(OUTPUT_FOLDER, f"flagged_{filename}")
 
-# === 6. Run CLIP on Valid Patches ===
-flagged = False
-box_label_map = []
+    # Load image safely
+    original_cv = cv2.imread(input_path)
+    if original_cv is None:
+        print(f"⚠️ Skipping unreadable file: {filename}")
+        continue
 
-if patch_tensors:
-    patch_batch = torch.cat(patch_tensors).to(device)
-    with torch.no_grad():
-        image_features = model.encode_image(patch_batch)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
-        similarities = image_features @ text_features.T
-        max_scores, best_indices = similarities.max(dim=1)
+    original_rgb = cv2.cvtColor(original_cv, cv2.COLOR_BGR2RGB)
+    height, width, _ = original_rgb.shape
+    output = original_cv.copy()
 
-    threshold = 0.29
-    for i, (score, sim_vec) in enumerate(zip(max_scores, similarities)):
-        x, y = patch_coords[i]
-        box_coords = (x, y, x+patch_size, y+patch_size)
+    patch_tensors = []
+    patch_coords = []
+    all_boxes = []
+    all_labels = []
 
-        # collect all prompts over threshold
-        label_stack = [prompts[j] for j, val in enumerate(sim_vec) if val.item() > threshold]
+    for y in range(0, height - PATCH_SIZE + 1, STRIDE):
+        for x in range(0, width - PATCH_SIZE + 1, STRIDE):
+            patch = original_rgb[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
+            gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+            stddev = gray.std()
+            brightness = gray.mean()
 
-        if label_stack:
-            flagged = True
-            all_boxes.append(box(*box_coords))
-            all_labels.append(label_stack)
-            print(f"❌ Patch at ({x},{y}) matched: {label_stack}")
+            if stddev < 8 or brightness > 245 or brightness < 10:
+                cv2.rectangle(output, (x, y), (x+PATCH_SIZE, y+PATCH_SIZE), (150, 150, 150), 1)
+                continue
 
-# === 7. Merge Overlapping Boxes ===
-merged = []
-if all_boxes:
-    unioned = unary_union(all_boxes)
-    if unioned.geom_type == 'Polygon':
-        unioned = [unioned]
-    elif unioned.geom_type == 'MultiPolygon':
-        unioned = list(unioned.geoms)
+            cv2.rectangle(output, (x, y), (x+PATCH_SIZE, y+PATCH_SIZE), (255, 200, 100), 1)
+            patch_tensor = preprocess(Image.fromarray(patch)).unsqueeze(0)
+            patch_tensors.append(patch_tensor)
+            patch_coords.append((x, y))
 
-    for group in unioned:
-        minx, miny, maxx, maxy = map(int, group.bounds)
+    print(f"📄 {filename}: {len(patch_tensors)} patches processed")
 
-        # gather all labels whose boxes intersect this group
-        labels_for_group = []
-        for lbl_box, labels in zip(all_boxes, all_labels):
-            if lbl_box.intersects(group):
-                labels_for_group.extend(labels)
+    flagged = False
+    if patch_tensors:
+        patch_batch = torch.cat(patch_tensors).to(device)
+        with torch.no_grad():
+            image_features = model.encode_image(patch_batch)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            similarities = image_features @ text_features.T
+            max_scores, best_indices = similarities.max(dim=1)
 
-        unique_labels = sorted(set(labels_for_group))
-        merged.append(((minx, miny, maxx, maxy), unique_labels))
+        for i, (score, sim_vec) in enumerate(zip(max_scores, similarities)):
+            x, y = patch_coords[i]
+            box_coords = (x, y, x+PATCH_SIZE, y+PATCH_SIZE)
+            labels = [prompts[j] for j, val in enumerate(sim_vec) if val.item() > THRESHOLD]
 
-# === 8. Draw Final Merged Boxes and Labels ===
-for (x1, y1, x2, y2), labels in merged:
-    cv2.rectangle(output, (x1, y1), (x2, y2), (0, 0, 255), 2)
-    for i, label in enumerate(labels):
-        y_offset = y1 + 20 + i * 18
-        cv2.putText(output, label, (x1 + 5, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            if labels:
+                flagged = True
+                all_boxes.append(box(*box_coords))
+                all_labels.append(labels)
+                print(f"❌ {filename} patch at ({x},{y}) matched: {labels}")
 
-# === 9. Save Output ===
-output_path = "highlighted_output_merged.png"
-cv2.imwrite(output_path, output)
+    # === Merge overlapping boxes ===
+    merged = []
+    if all_boxes:
+        unioned = unary_union(all_boxes)
+        if unioned.geom_type == 'Polygon':
+            unioned = [unioned]
+        elif unioned.geom_type == 'MultiPolygon':
+            unioned = list(unioned.geoms)
 
-if flagged:
-    print(f"\n⚠️ Flagged image. Merged output saved to '{output_path}'")
-else:
-    print("✅ No offensive patches detected.")
+        for group in unioned:
+            minx, miny, maxx, maxy = map(int, group.bounds)
+            labels_for_group = []
+            for lbl_box, labels in zip(all_boxes, all_labels):
+                if lbl_box.intersects(group):
+                    labels_for_group.extend(labels)
+            unique_labels = sorted(set(labels_for_group))
+            merged.append(((minx, miny, maxx, maxy), unique_labels))
+
+    for (x1, y1, x2, y2), labels in merged:
+        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        for i, label in enumerate(labels):
+            y_offset = y1 + 20 + i * 18
+            cv2.putText(output, label, (x1 + 5, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+    cv2.imwrite(output_path, output)
+    print(f"💾 Output saved to: {output_path}\n")
