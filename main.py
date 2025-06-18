@@ -7,6 +7,8 @@ import cv2
 from PIL import Image
 from shapely.geometry import box
 from shapely.ops import unary_union
+from skimage.measure import shannon_entropy
+
 
 # === Settings ===
 INPUT_FOLDER = "input_images"
@@ -92,12 +94,13 @@ if log:
         f.write("Renamed files:\n" + "\n".join(log))
     print(f"✏️ Renamed {len(log)} files. See {LOG_PATH}")
 
+skipped_coords = []  # NEW: store skipped tiles
+
 # === Process Images ===
 for filename in sorted(safe_files):
     input_path = os.path.join(INPUT_FOLDER, filename)
     output_path = os.path.join(OUTPUT_FOLDER, f"flagged_{filename}")
 
-    # Load image safely
     original_cv = cv2.imread(input_path)
     if original_cv is None:
         print(f"⚠️ Skipping unreadable file: {filename}")
@@ -111,27 +114,31 @@ for filename in sorted(safe_files):
     patch_coords = []
     all_boxes = []
     all_labels = []
+    skipped_coords = []  # NEW: Reset skipped list for each image
 
-    # === Multi-scale patch extraction ===
-    scan_configs = [(96, 32), (192, 48)]  # (patch_size, stride)
+    for y in range(0, height - PATCH_SIZE + 1, STRIDE):
+        for x in range(0, width - PATCH_SIZE + 1, STRIDE):
+            patch = original_rgb[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
+            gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+            stddev = gray.std()
+            brightness = gray.mean()
+            entropy = shannon_entropy(gray)
 
-    for PATCH_SIZE, STRIDE in scan_configs:
-        for y in range(0, height - PATCH_SIZE + 1, STRIDE):
-            for x in range(0, width - PATCH_SIZE + 1, STRIDE):
-                patch = original_rgb[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
-                gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
-                stddev = gray.std()
-                brightness = gray.mean()
+            if stddev < 12 or brightness > 240 or brightness < 10 or entropy < 4.0:
+                skipped_coords.append((x, y, PATCH_SIZE))
+                continue
 
-                if stddev < 8 or brightness > 245 or brightness < 10:
-                    cv2.rectangle(output, (x, y), (x+PATCH_SIZE, y+PATCH_SIZE), (150, 150, 150), 1)
-                    continue
+            # draw light blue box for processed tile
+            color = (255, 200, 100) if PATCH_SIZE == 96 else (255, 100, 50)
+            cv2.rectangle(output, (x, y), (x+PATCH_SIZE, y+PATCH_SIZE), color, 1)
+            patch_tensor = preprocess(Image.fromarray(patch)).unsqueeze(0)
+            patch_tensors.append(patch_tensor)
+            patch_coords.append((x, y))
 
-                color = (255, 200, 100) if PATCH_SIZE == 96 else (255, 100, 50)
-                cv2.rectangle(output, (x, y), (x+PATCH_SIZE, y+PATCH_SIZE), (255, 200, 100), 1)
-                patch_tensor = preprocess(Image.fromarray(patch)).unsqueeze(0)
-                patch_tensors.append(patch_tensor)
-                patch_coords.append((x, y, PATCH_SIZE))  # include size so you can draw later
+    # === Draw skipped gray patches FIRST ===
+    for (x, y, psize) in skipped_coords:
+        cv2.rectangle(output, (x, y), (x + psize, y + psize), (150, 150, 150), 1)
+
 
     print(f"📄 {filename}: {len(patch_tensors)} patches processed")
 
@@ -145,8 +152,8 @@ for filename in sorted(safe_files):
             max_scores, best_indices = similarities.max(dim=1)
 
         for i, (score, sim_vec) in enumerate(zip(max_scores, similarities)):
-            x, y, psize = patch_coords[i]
-            box_coords = (x, y, x+psize, y+psize)
+            x, y = patch_coords[i]
+            box_coords = (x, y, x+PATCH_SIZE, y+PATCH_SIZE)
             labels = [prompts[j] for j, val in enumerate(sim_vec) if val.item() > THRESHOLD]
 
             if labels:
@@ -155,7 +162,7 @@ for filename in sorted(safe_files):
                 all_labels.append(labels)
                 print(f"❌ {filename} patch at ({x},{y}) matched: {labels}")
 
-    # === Merge overlapping boxes and build score-labeled outputs ===
+    # === Merge & draw red boxes with labels ===
     merged = []
     if all_boxes:
         unioned = unary_union(all_boxes)
@@ -166,8 +173,6 @@ for filename in sorted(safe_files):
 
         for group in unioned:
             minx, miny, maxx, maxy = map(int, group.bounds)
-
-            # Track best score per label in this group
             label_score_map = {}
             for lbl_box, sim_vec in zip(all_boxes, similarities):
                 if lbl_box.intersects(group):
@@ -178,24 +183,21 @@ for filename in sorted(safe_files):
                             current = label_score_map.get(label, 0)
                             label_score_map[label] = max(current, score)
 
-            # Skip red box if no labels exceeded threshold
             if not label_score_map:
                 continue
-            
+
             labeled_outputs = [
                 f"{label} ({int(score * 100)})"
                 for label, score in sorted(label_score_map.items())
             ]
-            
+
             merged.append(((minx, miny, maxx, maxy), labeled_outputs))
 
-    # === Draw final merged boxes with labels
     for (x1, y1, x2, y2), labels in merged:
         cv2.rectangle(output, (x1, y1), (x2, y2), (0, 0, 255), 2)
         for i, label in enumerate(labels):
             y_offset = y1 + 20 + i * 18
             cv2.putText(output, label, (x1 + 5, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    # Save output image
     cv2.imwrite(output_path, output)
     print(f"💾 Output saved to: {output_path}\n")
