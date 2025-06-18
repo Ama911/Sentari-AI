@@ -33,3 +33,9 @@ dist/
 # Test outputs / temp files
 *.tmp
 *.bak
+
+# Ignore all files in output_images
+output_images/*
+
+# But keep the folder itself (optional)
+!output_images/.gitkeep
